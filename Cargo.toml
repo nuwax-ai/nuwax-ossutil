@@ -1,0 +1,39 @@
+[package]
+name = "nuwax-ossutil"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nuwax-ai/nuwax-ossutil"
+description = "阿里云 OSS 命令行上传工具，支持 V4 签名、分片上传、断点续传"
+
+[dependencies]
+# CLI
+clap = { version = "4.6", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client for OSS
+reqwest = { version = "0.13", features = ["json"] }
+
+# OSS V4 signing
+hmac = "0.13"
+sha2 = "0.11"
+sha1 = "0.11"          # checkpoint file hashing
+hex = "0.4"
+base64 = "0.22"         # checkpoint file naming
+urlencoding = "2"
+
+# Config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+# Utilities
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+chrono = "0.4"
+futures = "0.3"
+quick-xml = "0.40"
+indicatif = "0.18"
