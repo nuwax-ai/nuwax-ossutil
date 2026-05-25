@@ -209,9 +209,8 @@ impl OssClient {
                 .map_err(|e| OssError::Other(format!("invalid x-oss-date header: {}", e)))?,
         );
 
-        // V4 sign (host is derived, not sent as explicit header)
-        let host = format!("{}.{}", self.bucket_name, self.endpoint);
-        let authorization = self.sign_request(method, object_key, query, &headers, &host);
+        // V4 sign
+        let authorization = self.sign_request(method, object_key, query, &headers);
 
         // Build and send request
         let mut req = match method {
@@ -321,7 +320,7 @@ impl OssClient {
                 .await?;
 
             let body = response.text().await?;
-            let (keys, is_truncated, next_marker) = self.parse_list_response(&body);
+            let (keys, is_truncated, next_marker) = Self::parse_list_response(&body);
 
             if keys.is_empty() && is_truncated {
                 break;
@@ -412,7 +411,14 @@ impl OssClient {
                     );
                     (cp.upload_id, cp.completed_parts)
                 }
-                _ => {
+                Some(stale_cp) => {
+                    // Checkpoint exists but file has changed — abort the old upload
+                    // to prevent orphaned multipart uploads accumulating on OSS
+                    let _ = self.abort_multipart(remote_path, &stale_cp.upload_id).await;
+                    let upload_id = self.initiate_multipart(remote_path, content_type).await?;
+                    (upload_id, vec![None; total_parts as usize])
+                }
+                None => {
                     let upload_id = self.initiate_multipart(remote_path, content_type).await?;
                     (upload_id, vec![None; total_parts as usize])
                 }
@@ -628,7 +634,6 @@ impl OssClient {
     }
 
     /// Abort a multipart upload to clean up orphaned parts on OSS.
-    #[allow(dead_code)]
     pub async fn abort_multipart(&self, remote_path: &str, upload_id: &str) -> Result<()> {
         let mut query = QueryParams::new();
         query.insert("uploadId".to_string(), upload_id.to_string());
@@ -780,7 +785,6 @@ impl OssClient {
         object_key: &str,
         query: &QueryParams,
         headers: &HeaderMap,
-        _host: &str,
     ) -> String {
         let date_time_string = headers
             .get("x-oss-date")
@@ -794,9 +798,10 @@ impl OssClient {
         let canonical_headers = self.build_canonical_headers(headers);
         // AdditionalHeaders: empty (no optional headers like host are signed)
         let additional_headers = "";
-        // canonical_headers and additional_headers each end with their own \n,
-        // so the format just joins components with single \n separators.
-        // Result: ...last-header\n\n\nUNSIGNED-PAYLOAD (3 \n = correct per V4 spec)
+        // canonical_headers ends with a trailing \n (each header line has \n).
+        // The format inserts \n between canonical_headers and additional_headers,
+        // and another \n between additional_headers and UNSIGNED-PAYLOAD.
+        // Result: ...last-header\n + \n + (empty) + \n + UNSIGNED-PAYLOAD = 3 \n total
         let canonical_request = format!(
             "{}\n{}\n{}\n{}\n{}\nUNSIGNED-PAYLOAD",
             method, canonical_uri, canonical_query, canonical_headers, additional_headers
@@ -876,7 +881,7 @@ impl OssClient {
     }
 
     /// Parse ListBucketResult XML, returning (keys, is_truncated, next_marker).
-    fn parse_list_response(&self, xml: &str) -> (Vec<String>, bool, Option<String>) {
+    fn parse_list_response(xml: &str) -> (Vec<String>, bool, Option<String>) {
         let mut keys = Vec::new();
         let mut reader = Reader::from_str(xml);
         let mut current_tag = String::new();
