@@ -10,7 +10,8 @@ use crate::oss::{guess_content_type, validate_file_path, OssClient};
 /// - `remote_dir` is always treated as a directory path (trailing `/` auto-appended).
 /// - File names are derived from the local file name.
 /// - `rename` only works for single-file uploads.
-pub async fn upload_files(files: &[PathBuf], remote_dir: &str, rename: Option<&str>) -> Result<()> {
+/// - `skip_dir`: if true, skip directories silently; if false, error on directories.
+pub async fn upload_files(files: &[PathBuf], remote_dir: &str, rename: Option<&str>, skip_dir: bool) -> Result<()> {
     // --name only valid for single file
     if rename.is_some() && files.len() > 1 {
         return Err(anyhow!("--name 参数仅在上传单个文件时有效"));
@@ -19,11 +20,16 @@ pub async fn upload_files(files: &[PathBuf], remote_dir: &str, rename: Option<&s
     if files.len() == 1 {
         let file_path = files[0].to_str().ok_or_else(|| anyhow!("无效的文件路径"))?;
         if !validate_file_path(file_path) {
+            // Check if it's a directory
+            if files[0].is_dir() && skip_dir {
+                eprintln!("⚠️  跳过目录: {}", file_path);
+                return Ok(());
+            }
             return Err(anyhow!("文件不存在或不是普通文件: {}", file_path));
         }
         upload_single_file(file_path, remote_dir, rename).await
     } else {
-        upload_multiple_files(files, remote_dir).await
+        upload_multiple_files(files, remote_dir, skip_dir).await
     }
 }
 
@@ -67,7 +73,7 @@ async fn upload_single_file(file_path: &str, remote_dir: &str, rename: Option<&s
 }
 
 /// Upload multiple files to OSS under a directory.
-async fn upload_multiple_files(files: &[PathBuf], remote_dir: &str) -> Result<()> {
+async fn upload_multiple_files(files: &[PathBuf], remote_dir: &str, skip_dir: bool) -> Result<()> {
     let config = load_config()?;
     let client = OssClient::new(&config)?;
 
@@ -80,14 +86,23 @@ async fn upload_multiple_files(files: &[PathBuf], remote_dir: &str) -> Result<()
 
     let dir = normalize_remote_dir(remote_dir);
 
-    // Filter out directories and warn user
+    // Check for directories
     let actual_files: Vec<_> = files.iter().filter(|f| !f.is_dir()).collect();
-    let skipped_count = files.len() - actual_files.len();
+    let dir_count = files.len() - actual_files.len();
 
-    if skipped_count > 0 {
-        for file in files {
-            if file.is_dir() {
-                eprintln!("⚠️  跳过目录: {}", file.display());
+    if dir_count > 0 {
+        if skip_dir {
+            for file in files {
+                if file.is_dir() {
+                    eprintln!("⚠️  跳过目录: {}", file.display());
+                }
+            }
+        } else {
+            // skip_dir=false: error on directories
+            for file in files {
+                if file.is_dir() {
+                    return Err(anyhow!("不是文件: {}", file.display()));
+                }
             }
         }
     }
@@ -98,8 +113,8 @@ async fn upload_multiple_files(files: &[PathBuf], remote_dir: &str) -> Result<()
 
     let total = actual_files.len();
     println!("📤 开始上传 {} 个文件到 {}/{}", total, config.bucket_name, dir);
-    if skipped_count > 0 {
-        println!("   (跳过 {} 个目录)", skipped_count);
+    if dir_count > 0 && skip_dir {
+        println!("   (跳过 {} 个目录)", dir_count);
     }
     println!();
 

@@ -51,6 +51,10 @@ enum Commands {
         /// 重命名上传文件 (仅单文件时有效)
         #[arg(long)]
         name: Option<String>,
+
+        /// 遇到目录时是否跳过 (true: 跳过目录, false: 报错退出)
+        #[arg(long, default_value = "true", default_missing_value = "true", num_args = 0..=1, value_parser = clap::value_parser!(bool))]
+        skip_dir: bool,
     },
 
     /// 上传 Docker 文件到 OSS (自动生成 docker/{timestamp}/ 路径)
@@ -120,8 +124,8 @@ async fn main() -> Result<()> {
             println!("✅ 配置已保存到 ~/.config/nuwax-ossutil.toml");
         }
 
-        Commands::Upload { file, remote, name } => {
-            commands::upload_files(&file, &remote, name.as_deref()).await?;
+        Commands::Upload { file, remote, name, skip_dir } => {
+            commands::upload_files(&file, &remote, name.as_deref(), skip_dir).await?;
         }
 
         Commands::UploadDocker { file } => {
