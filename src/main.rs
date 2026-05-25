@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod commands;
@@ -7,9 +7,17 @@ mod config;
 mod oss;
 
 #[derive(Parser)]
-#[command(name = "nuwax-ossutil")]
-#[command(about = "阿里云 OSS 上传工具 - 支持 V4 签名", long_about = None)]
-#[command(version)]
+#[command(name = "nuwax-ossutil", version, about = "阿里云 OSS 上传工具 - 支持 V4 签名", long_about = None, disable_version_flag = true)]
+struct Cli {
+    /// 打印版本信息
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    version: (),
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// 配置阿里云 OSS 凭证
     Config {
@@ -65,9 +73,9 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Commands::parse();
+    let cli = Cli::parse();
 
-    match args {
+    match cli.command {
         Commands::Config {
             endpoint,
             key_id,
