@@ -40,13 +40,17 @@ enum Commands {
 
     /// 上传文件到 OSS
     Upload {
-        /// 本地文件路径
-        #[arg(short, long)]
-        file: PathBuf,
+        /// 本地文件路径 (可指定多个)
+        #[arg(short, long, required = true, num_args = 1..)]
+        file: Vec<PathBuf>,
 
-        /// OSS 目标路径 (不含 bucket)
-        #[arg(short, long)]
+        /// OSS 目标目录路径 (例如: test-upload/test)
+        #[arg(short, long, required = true)]
         remote: String,
+
+        /// 重命名上传文件 (仅单文件时有效)
+        #[arg(long)]
+        name: Option<String>,
     },
 
     /// 上传 Docker 文件到 OSS (自动生成 docker/{timestamp}/ 路径)
@@ -116,8 +120,8 @@ async fn main() -> Result<()> {
             println!("✅ 配置已保存到 ~/.config/nuwax-ossutil.toml");
         }
 
-        Commands::Upload { file, remote } => {
-            commands::upload_file(file.to_str().unwrap(), &remote).await?;
+        Commands::Upload { file, remote, name } => {
+            commands::upload_files(&file, &remote, name.as_deref()).await?;
         }
 
         Commands::UploadDocker { file } => {

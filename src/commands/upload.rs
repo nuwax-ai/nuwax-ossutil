@@ -1,37 +1,212 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use futures::future::join_all;
+use std::path::PathBuf;
 
 use crate::config::load_config;
-use crate::oss::{guess_content_type, validate_file_path};
+use crate::oss::{guess_content_type, validate_file_path, OssClient};
 
-pub async fn upload_file(file_path: &str, remote_path: &str) -> Result<()> {
-    let config = load_config()?;
-
-    // Fail Fast: validate inputs before creating client
-    if !validate_file_path(file_path) {
-        return Err(anyhow::anyhow!("文件不存在或不是普通文件: {}", file_path));
+/// Upload one or more files to a remote directory.
+///
+/// - `remote_dir` is always treated as a directory path (trailing `/` auto-appended).
+/// - File names are derived from the local file name.
+/// - `rename` only works for single-file uploads.
+pub async fn upload_files(files: &[PathBuf], remote_dir: &str, rename: Option<&str>) -> Result<()> {
+    // --name only valid for single file
+    if rename.is_some() && files.len() > 1 {
+        return Err(anyhow!("--name 参数仅在上传单个文件时有效"));
     }
 
-    let client = crate::oss::OssClient::new(&config)?;
+    if files.len() == 1 {
+        let file_path = files[0].to_str().ok_or_else(|| anyhow!("无效的文件路径"))?;
+        if !validate_file_path(file_path) {
+            return Err(anyhow!("文件不存在或不是普通文件: {}", file_path));
+        }
+        upload_single_file(file_path, remote_dir, rename).await
+    } else {
+        upload_multiple_files(files, remote_dir).await
+    }
+}
 
-    let file_size = tokio::fs::metadata(file_path)
-        .await
-        .map(|m| m.len())
-        .unwrap_or(0);
+/// Normalize remote directory path: ensure it ends with `/`
+fn normalize_remote_dir(remote: &str) -> String {
+    if remote.ends_with('/') {
+        remote.to_string()
+    } else {
+        format!("{}/", remote)
+    }
+}
 
-    println!(
-        "📤 开始上传: {} -> {}/{}",
-        file_path, config.bucket_name, remote_path
-    );
+/// Upload a single file to OSS.
+async fn upload_single_file(file_path: &str, remote_dir: &str, rename: Option<&str>) -> Result<()> {
+    let config = load_config()?;
+    let client = OssClient::new(&config)?;
+
+    let dir = normalize_remote_dir(remote_dir);
+    let filename = rename
+        .map(String::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(file_path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        });
+    let full_remote = format!("{}{}", dir, filename);
+
+    let file_size = tokio::fs::metadata(file_path).await.map(|m| m.len()).unwrap_or(0);
+
+    println!("📤 开始上传: {} -> {}/{}", file_path, config.bucket_name, full_remote);
     println!("   文件大小: {} bytes", file_size);
 
-    let content_type = guess_content_type(remote_path);
-    // Use upload_file_smart for proper semaphore control and multipart support
-    let url = client
-        .upload_file_smart(file_path, remote_path, &content_type)
-        .await?;
+    let content_type = guess_content_type(&full_remote);
+    let url = client.upload_file_smart(file_path, &full_remote, &content_type).await?;
 
     println!("✅ 上传成功!");
     println!("   下载地址: {}", url);
-
     Ok(())
+}
+
+/// Upload multiple files to OSS under a directory.
+async fn upload_multiple_files(files: &[PathBuf], remote_dir: &str) -> Result<()> {
+    let config = load_config()?;
+    let client = OssClient::new(&config)?;
+
+    // Fail Fast: validate all files exist
+    for file in files {
+        if !file.exists() {
+            return Err(anyhow!("文件不存在: {}", file.display()));
+        }
+    }
+
+    let dir = normalize_remote_dir(remote_dir);
+
+    // Filter out directories and warn user
+    let actual_files: Vec<_> = files.iter().filter(|f| !f.is_dir()).collect();
+    let skipped_count = files.len() - actual_files.len();
+
+    if skipped_count > 0 {
+        for file in files {
+            if file.is_dir() {
+                eprintln!("⚠️  跳过目录: {}", file.display());
+            }
+        }
+    }
+
+    if actual_files.is_empty() {
+        return Err(anyhow!("没有可上传的文件"));
+    }
+
+    let total = actual_files.len();
+    println!("📤 开始上传 {} 个文件到 {}/{}", total, config.bucket_name, dir);
+    if skipped_count > 0 {
+        println!("   (跳过 {} 个目录)", skipped_count);
+    }
+    println!();
+
+    let mut upload_futures = Vec::new();
+
+    for file in actual_files {
+        let filename = file
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let full_remote = format!("{}{}", dir, filename);
+        let content_type = guess_content_type(&filename);
+        let local_path = file.to_string_lossy().to_string();
+        let client = client.clone();
+
+        upload_futures.push(async move {
+            let file_size = tokio::fs::metadata(&local_path).await.map(|m| m.len()).unwrap_or(0);
+            let is_multipart = file_size >= 5 * 1024 * 1024;
+
+            let result = client
+                .upload_file_smart(&local_path, &full_remote, &content_type)
+                .await;
+
+            let (download_url, error) = match result {
+                Ok(url) => (Some(url), None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+
+            UploadResult {
+                filename,
+                file_size,
+                is_multipart,
+                download_url,
+                error,
+            }
+        });
+    }
+
+    let results = join_all(upload_futures).await;
+
+    // Print results
+    let mut success_count = 0;
+    for (i, r) in results.iter().enumerate() {
+        let size_str = format_file_size(r.file_size);
+        let upload_type = if r.is_multipart { " (分片上传)" } else { "" };
+
+        if r.download_url.is_some() {
+            success_count += 1;
+            println!(
+                "  [{}/{}] {} ({}) ... ✅ 成功{}",
+                i + 1,
+                total,
+                r.filename,
+                size_str,
+                upload_type
+            );
+            if let Some(url) = &r.download_url {
+                println!("         下载: {}", url);
+            }
+        } else {
+            println!(
+                "  [{}/{}] {} ({}) ... ❌ 失败{}",
+                i + 1,
+                total,
+                r.filename,
+                size_str,
+                upload_type
+            );
+            if let Some(err) = &r.error {
+                println!("         错误: {}", err);
+            }
+        }
+    }
+
+    println!();
+    println!("📊 上传完成: 成功 {}/{}", success_count, total);
+
+    if success_count == 0 {
+        Err(anyhow!("所有文件上传失败"))
+    } else if success_count < total {
+        Err(anyhow!("部分文件上传失败: {}/{}", total - success_count, total))
+    } else {
+        Ok(())
+    }
+}
+
+struct UploadResult {
+    filename: String,
+    file_size: u64,
+    is_multipart: bool,
+    download_url: Option<String>,
+    error: Option<String>,
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }
