@@ -29,30 +29,40 @@ pub struct OssApiError {
 }
 
 impl OssApiError {
-    #[allow(dead_code)]
     pub fn from_xml(xml_content: &str) -> Self {
         let mut reader = Reader::from_str(xml_content);
         let mut result = Self::default();
         let mut current_tag = String::new();
+        let mut text_buf = String::new();
 
         loop {
             match reader.read_event() {
                 Ok(Event::Start(ref e)) => {
-                    current_tag = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                    current_tag =
+                        String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                    text_buf.clear();
                 }
                 Ok(Event::Text(ref e)) => {
-                    let text = String::from_utf8_lossy(e).to_string();
-                    match current_tag.as_str() {
-                        "Code" => result.code = text,
-                        "Message" => result.message = text,
-                        "RequestId" => result.request_id = text,
-                        "HostId" => result.host_id = text,
-                        "EC" => result.ec = text,
-                        "RecommendDoc" => result.recommend_doc = text,
-                        _ => {}
-                    }
+                    text_buf.push_str(&String::from_utf8_lossy(e));
                 }
-                Ok(Event::End(ref e)) if e.name() == QName(b"Error") => break,
+                Ok(Event::End(ref e)) => {
+                    let trimmed = text_buf.trim().to_string();
+                    if !trimmed.is_empty() {
+                        match current_tag.as_str() {
+                            "Code" => result.code = trimmed,
+                            "Message" => result.message = trimmed,
+                            "RequestId" => result.request_id = trimmed,
+                            "HostId" => result.host_id = trimmed,
+                            "EC" => result.ec = trimmed,
+                            "RecommendDoc" => result.recommend_doc = trimmed,
+                            _ => {}
+                        }
+                    }
+                    if e.name() == QName(b"Error") {
+                        break;
+                    }
+                    text_buf.clear();
+                }
                 Ok(Event::Eof) => break,
                 Err(_) => break,
                 _ => {}

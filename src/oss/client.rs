@@ -233,14 +233,19 @@ impl OssClient {
         let response = req.send().await?;
 
         if !response.status().is_success() {
-            return Err(self.handle_error_response(response).await);
+            return Err(self.handle_error_response(method, &url, response).await);
         }
 
         Ok(response)
     }
 
     /// Parse error response body as OssApiError, fallback to raw text.
-    async fn handle_error_response(&self, response: reqwest::Response) -> OssError {
+    async fn handle_error_response(
+        &self,
+        method: &str,
+        url: &str,
+        response: reqwest::Response,
+    ) -> OssError {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
 
@@ -251,10 +256,17 @@ impl OssClient {
             }
         }
 
+        // Show full diagnostics when XML parsing fails to extract error details
         if body.is_empty() {
-            OssError::Other(format!("HTTP {}", status))
+            OssError::Other(format!("{} {} → HTTP {} (no response body)", method, url, status))
         } else {
-            OssError::Other(format!("HTTP {}: {}", status, body))
+            OssError::Other(format!(
+                "{} {} → HTTP {}: {}",
+                method,
+                url,
+                status,
+                body.trim()
+            ))
         }
     }
 
@@ -718,12 +730,12 @@ impl OssClient {
         )
     }
 
-    /// Build canonical headers: host always included, plus content-type/content-md5/x-oss-*.
-    fn build_canonical_headers(&self, headers: &HeaderMap, host: &str) -> String {
+    /// Build canonical headers: only x-oss-content-sha256 (required), Content-Type,
+    /// Content-MD5, and x-oss-* headers participate in V4 signing.
+    /// The `host` header is NOT included unless listed in AdditionalHeaders.
+    /// Each header line ends with a trailing \n per the V4 spec.
+    fn build_canonical_headers(&self, headers: &HeaderMap) -> String {
         let mut canonical: Vec<(String, String)> = Vec::new();
-
-        // Host is always part of canonical headers
-        canonical.push(("host".to_string(), host.to_string()));
 
         for (name, value) in headers.iter() {
             let key = name.as_str().to_lowercase();
@@ -736,9 +748,9 @@ impl OssClient {
 
         canonical
             .iter()
-            .map(|(k, v)| format!("{}:{}", k, v))
+            .map(|(k, v)| format!("{}:{}\n", k, v))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("")
     }
 
     /// Derive V4 signing key:
@@ -752,13 +764,23 @@ impl OssClient {
     }
 
     /// V4 signing: produce the Authorization header value.
+    ///
+    /// Canonical request format (6 components per OSS V4 spec):
+    /// ```text
+    /// HTTPVerb\n
+    /// CanonicalURI\n
+    /// CanonicalQueryString\n
+    /// CanonicalHeaders\n
+    /// AdditionalHeaders\n
+    /// HashedPayLoad
+    /// ```
     fn sign_request(
         &self,
         method: &str,
         object_key: &str,
         query: &QueryParams,
         headers: &HeaderMap,
-        host: &str,
+        _host: &str,
     ) -> String {
         let date_time_string = headers
             .get("x-oss-date")
@@ -766,13 +788,18 @@ impl OssClient {
             .unwrap_or("");
         let date_string = &date_time_string[..8];
 
-        // Build canonical request
+        // Build canonical request (6 components)
         let canonical_uri = self.build_canonical_uri(object_key);
         let canonical_query = Self::build_canonical_query_string(query);
-        let canonical_headers = self.build_canonical_headers(headers, host);
+        let canonical_headers = self.build_canonical_headers(headers);
+        // AdditionalHeaders: empty (no optional headers like host are signed)
+        let additional_headers = "";
+        // canonical_headers and additional_headers each end with their own \n,
+        // so the format just joins components with single \n separators.
+        // Result: ...last-header\n\n\nUNSIGNED-PAYLOAD (3 \n = correct per V4 spec)
         let canonical_request = format!(
-            "{}\n{}\n{}\n{}\n\nUNSIGNED-PAYLOAD",
-            method, canonical_uri, canonical_query, canonical_headers
+            "{}\n{}\n{}\n{}\n{}\nUNSIGNED-PAYLOAD",
+            method, canonical_uri, canonical_query, canonical_headers, additional_headers
         );
 
         log::debug!("canonical request:\n{}", canonical_request);
@@ -792,7 +819,7 @@ impl OssClient {
 
         log::debug!("signature: {}", signature);
 
-        // Build Authorization header
+        // Build Authorization header (no AdditionalHeaders field since it's empty)
         format!(
             "OSS4-HMAC-SHA256 Credential={}/{}/{}/oss/aliyun_v4_request,Signature={}",
             self.access_key_id, date_string, self.region, signature
@@ -819,17 +846,20 @@ impl OssClient {
     fn parse_upload_id(xml: &str) -> Result<String> {
         let mut reader = Reader::from_str(xml);
         let mut in_upload_id = false;
+        let mut text_buf = String::new();
         let mut upload_id = String::new();
 
         loop {
             match reader.read_event() {
                 Ok(Event::Start(ref e)) if e.name() == QName(b"UploadId") => {
                     in_upload_id = true;
+                    text_buf.clear();
                 }
-                Ok(Event::Text(e)) if in_upload_id => {
-                    upload_id = String::from_utf8_lossy(&e).into_owned();
+                Ok(Event::Text(ref e)) if in_upload_id => {
+                    text_buf.push_str(&String::from_utf8_lossy(e));
                 }
                 Ok(Event::End(ref e)) if e.name() == QName(b"UploadId") => {
+                    upload_id = text_buf.trim().to_string();
                     in_upload_id = false;
                 }
                 Ok(Event::Eof) => break,
@@ -849,36 +879,37 @@ impl OssClient {
     fn parse_list_response(&self, xml: &str) -> (Vec<String>, bool, Option<String>) {
         let mut keys = Vec::new();
         let mut reader = Reader::from_str(xml);
-        let mut in_key = false;
-        let mut in_is_truncated = false;
-        let mut in_next_marker = false;
+        let mut current_tag = String::new();
+        let mut text_buf = String::new();
         let mut is_truncated = false;
         let mut next_marker: Option<String> = None;
 
         loop {
             match reader.read_event() {
-                Ok(Event::Start(ref e)) => match e.name().as_ref() {
-                    b"Key" => in_key = true,
-                    b"IsTruncated" => in_is_truncated = true,
-                    b"NextMarker" => in_next_marker = true,
-                    _ => {}
-                },
-                Ok(Event::Text(e)) => {
-                    let text = String::from_utf8_lossy(&e).to_string();
-                    if in_key {
-                        keys.push(text);
-                    } else if in_is_truncated {
-                        is_truncated = text == "true";
-                    } else if in_next_marker {
-                        next_marker = Some(text);
+                Ok(Event::Start(ref e)) => {
+                    let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                    if matches!(name.as_str(), "Key" | "IsTruncated" | "NextMarker") {
+                        current_tag = name;
+                        text_buf.clear();
                     }
                 }
-                Ok(Event::End(ref e)) => match e.name().as_ref() {
-                    b"Key" => in_key = false,
-                    b"IsTruncated" => in_is_truncated = false,
-                    b"NextMarker" => in_next_marker = false,
-                    _ => {}
-                },
+                Ok(Event::Text(ref e)) if !current_tag.is_empty() => {
+                    text_buf.push_str(&String::from_utf8_lossy(e));
+                }
+                Ok(Event::End(ref e)) => {
+                    let tag = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                    if !current_tag.is_empty() && tag == current_tag {
+                        let trimmed = text_buf.trim().to_string();
+                        match current_tag.as_str() {
+                            "Key" => keys.push(trimmed),
+                            "IsTruncated" => is_truncated = trimmed == "true",
+                            "NextMarker" => next_marker = Some(trimmed),
+                            _ => {}
+                        }
+                        current_tag.clear();
+                        text_buf.clear();
+                    }
+                }
                 Ok(Event::Eof) => break,
                 Err(_) => break,
                 _ => {}
