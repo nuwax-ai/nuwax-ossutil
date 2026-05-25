@@ -40,9 +40,13 @@ enum Commands {
 
     /// 上传文件到 OSS
     Upload {
-        /// 本地文件路径 (可指定多个)
-        #[arg(short, long, required = true, num_args = 1..)]
+        /// 本地文件路径 (可通过 -f 或直接传入位置参数，支持目录自动展开)
+        #[arg(short, long, num_args = 1..)]
         file: Vec<PathBuf>,
+
+        /// 本地文件/目录路径 (位置参数，可传多个)
+        #[arg(num_args = 0..)]
+        paths: Vec<PathBuf>,
 
         /// OSS 目标目录路径 (例如: test-upload/test)
         #[arg(short, long, required = true)]
@@ -59,9 +63,13 @@ enum Commands {
 
     /// 上传 Docker 文件到 OSS (自动生成 docker/{timestamp}/ 路径)
     UploadDocker {
-        /// 本地文件路径 (可指定多个)
-        #[arg(short, long, required = true, num_args = 1..)]
+        /// 本地文件路径 (可通过 -f 或直接传入位置参数，支持目录自动展开)
+        #[arg(short, long, num_args = 1..)]
         file: Vec<PathBuf>,
+
+        /// 本地文件/目录路径 (位置参数，可传多个)
+        #[arg(num_args = 0..)]
+        paths: Vec<PathBuf>,
     },
 
     /// 列出 OSS 中的文件
@@ -124,12 +132,22 @@ async fn main() -> Result<()> {
             println!("✅ 配置已保存到 ~/.config/nuwax-ossutil.toml");
         }
 
-        Commands::Upload { file, remote, name, skip_dir } => {
-            commands::upload_files(&file, &remote, name.as_deref(), skip_dir).await?;
+        Commands::Upload { file, paths, remote, name, skip_dir } => {
+            let mut all_files = file;
+            all_files.extend(paths);
+            if all_files.is_empty() {
+                return Err(anyhow::anyhow!("请指定至少一个文件或目录路径 (通过 -f 或直接传入位置参数)"));
+            }
+            commands::upload_files(&all_files, &remote, name.as_deref(), skip_dir).await?;
         }
 
-        Commands::UploadDocker { file } => {
-            commands::upload_docker_files(&file).await?;
+        Commands::UploadDocker { file, paths } => {
+            let mut all_files = file;
+            all_files.extend(paths);
+            if all_files.is_empty() {
+                return Err(anyhow::anyhow!("请指定至少一个文件或目录路径 (通过 -f 或直接传入位置参数)"));
+            }
+            commands::upload_docker_files(&all_files).await?;
         }
 
         Commands::List { prefix } => {

@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use futures::future::join_all;
 use std::path::PathBuf;
 
+use super::common::{expand_paths, format_file_size, UploadResult};
 use crate::config::load_config;
 use crate::oss::{guess_content_type, validate_file_path, OssClient};
 
@@ -11,8 +12,14 @@ use crate::oss::{guess_content_type, validate_file_path, OssClient};
 /// - File names are derived from the local file name.
 /// - `rename` only works for single-file uploads.
 /// - `skip_dir`: if true, skip directories silently; if false, error on directories.
+/// - Directories passed as input are auto-expanded to their direct children.
 pub async fn upload_files(files: &[PathBuf], remote_dir: &str, rename: Option<&str>, skip_dir: bool) -> Result<()> {
-    // --name only valid for single file
+    let files = expand_paths(files, skip_dir)?;
+
+    if files.is_empty() {
+        return Err(anyhow!("没有可上传的文件"));
+    }
+
     if rename.is_some() && files.len() > 1 {
         return Err(anyhow!("--name 参数仅在上传单个文件时有效"));
     }
@@ -20,16 +27,11 @@ pub async fn upload_files(files: &[PathBuf], remote_dir: &str, rename: Option<&s
     if files.len() == 1 {
         let file_path = files[0].to_str().ok_or_else(|| anyhow!("无效的文件路径"))?;
         if !validate_file_path(file_path) {
-            // Check if it's a directory
-            if files[0].is_dir() && skip_dir {
-                eprintln!("⚠️  跳过目录: {}", file_path);
-                return Ok(());
-            }
             return Err(anyhow!("文件不存在或不是普通文件: {}", file_path));
         }
         upload_single_file(file_path, remote_dir, rename).await
     } else {
-        upload_multiple_files(files, remote_dir, skip_dir).await
+        upload_multiple_files(&files, remote_dir).await
     }
 }
 
@@ -73,54 +75,30 @@ async fn upload_single_file(file_path: &str, remote_dir: &str, rename: Option<&s
 }
 
 /// Upload multiple files to OSS under a directory.
-async fn upload_multiple_files(files: &[PathBuf], remote_dir: &str, skip_dir: bool) -> Result<()> {
+/// Note: directories should already be expanded by expand_paths before calling this.
+async fn upload_multiple_files(files: &[PathBuf], remote_dir: &str) -> Result<()> {
     let config = load_config()?;
     let client = OssClient::new(&config)?;
 
-    // Fail Fast: validate all files exist
+    // Fail Fast: validate all files exist and are regular files
     for file in files {
         if !file.exists() {
             return Err(anyhow!("文件不存在: {}", file.display()));
         }
-    }
-
-    let dir = normalize_remote_dir(remote_dir);
-
-    // Check for directories
-    let actual_files: Vec<_> = files.iter().filter(|f| !f.is_dir()).collect();
-    let dir_count = files.len() - actual_files.len();
-
-    if dir_count > 0 {
-        if skip_dir {
-            for file in files {
-                if file.is_dir() {
-                    eprintln!("⚠️  跳过目录: {}", file.display());
-                }
-            }
-        } else {
-            // skip_dir=false: error on directories
-            for file in files {
-                if file.is_dir() {
-                    return Err(anyhow!("不是文件: {}", file.display()));
-                }
-            }
+        if !file.is_file() {
+            return Err(anyhow!("不是普通文件: {}", file.display()));
         }
     }
 
-    if actual_files.is_empty() {
-        return Err(anyhow!("没有可上传的文件"));
-    }
+    let dir = normalize_remote_dir(remote_dir);
+    let total = files.len();
 
-    let total = actual_files.len();
     println!("📤 开始上传 {} 个文件到 {}/{}", total, config.bucket_name, dir);
-    if dir_count > 0 && skip_dir {
-        println!("   (跳过 {} 个目录)", dir_count);
-    }
     println!();
 
     let mut upload_futures = Vec::new();
 
-    for file in actual_files {
+    for file in files {
         let filename = file
             .file_name()
             .unwrap_or_default()
@@ -199,29 +177,5 @@ async fn upload_multiple_files(files: &[PathBuf], remote_dir: &str, skip_dir: bo
         Err(anyhow!("部分文件上传失败: {}/{}", total - success_count, total))
     } else {
         Ok(())
-    }
-}
-
-struct UploadResult {
-    filename: String,
-    file_size: u64,
-    is_multipart: bool,
-    download_url: Option<String>,
-    error: Option<String>,
-}
-
-fn format_file_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
     }
 }

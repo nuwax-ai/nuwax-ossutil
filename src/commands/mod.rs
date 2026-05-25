@@ -1,3 +1,4 @@
+pub mod common;
 pub mod upload;
 pub mod list;
 pub mod r#delete;

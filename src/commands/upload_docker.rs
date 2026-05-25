@@ -3,23 +3,22 @@ use chrono::Utc;
 use futures::future::join_all;
 use std::path::PathBuf;
 
+use super::common::{expand_paths, format_file_size, UploadResult};
 use crate::config::load_config;
 use crate::oss::{OssClient, guess_content_type};
 
-struct UploadResult {
-    filename: String,
-    success: bool,
-    download_url: Option<String>,
-    file_size: u64,
-    error: Option<String>,
-    is_multipart: bool,
-}
-
 pub async fn upload_docker_files(files: &[PathBuf]) -> Result<()> {
+    // Expand directories into file lists (always skip sub-directories)
+    let files = expand_paths(files, true)?;
+
+    if files.is_empty() {
+        return Err(anyhow::anyhow!("没有可上传的文件"));
+    }
+
     let config = load_config()?;
 
-    // Validate all files exist (Fail Fast)
-    for file in files {
+    // Fail Fast: validate all files exist and are regular files
+    for file in &files {
         if !file.exists() {
             return Err(anyhow::anyhow!("文件不存在: {}", file.display()));
         }
@@ -40,7 +39,7 @@ pub async fn upload_docker_files(files: &[PathBuf]) -> Result<()> {
     // Build upload tasks
     let mut upload_futures = Vec::new();
 
-    for file in files {
+    for file in &files {
         let filename = file
             .file_name()
             .unwrap_or_default()
@@ -59,26 +58,21 @@ pub async fn upload_docker_files(files: &[PathBuf]) -> Result<()> {
                 .unwrap_or(0);
             let is_multipart = file_size >= 5 * 1024 * 1024;
 
-            match client
+            let result = client
                 .upload_file_smart(&local_path, &remote_path, &content_type)
-                .await
-            {
-                Ok(url) => UploadResult {
-                    filename,
-                    success: true,
-                    download_url: Some(url),
-                    file_size,
-                    error: None,
-                    is_multipart,
-                },
-                Err(e) => UploadResult {
-                    filename,
-                    success: false,
-                    download_url: None,
-                    file_size,
-                    error: Some(e.to_string()),
-                    is_multipart,
-                },
+                .await;
+
+            let (download_url, error) = match result {
+                Ok(url) => (Some(url), None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+
+            UploadResult {
+                filename,
+                file_size,
+                is_multipart,
+                download_url,
+                error,
             }
         });
     }
@@ -88,25 +82,25 @@ pub async fn upload_docker_files(files: &[PathBuf]) -> Result<()> {
 
     // Print results
     let mut success_count = 0;
-    for (i, result) in results.iter().enumerate() {
-        let size_str = format_file_size(result.file_size);
-        let upload_type = if result.is_multipart {
+    for (i, r) in results.iter().enumerate() {
+        let size_str = format_file_size(r.file_size);
+        let upload_type = if r.is_multipart {
             " (分片上传)"
         } else {
             ""
         };
 
-        if result.success {
+        if r.download_url.is_some() {
             success_count += 1;
             println!(
                 "  [{}/{}] {} ({}) ... ✅ 成功{}",
                 i + 1,
                 total,
-                result.filename,
+                r.filename,
                 size_str,
                 upload_type
             );
-            if let Some(url) = &result.download_url {
+            if let Some(url) = &r.download_url {
                 println!("         下载: {}", url);
             }
         } else {
@@ -114,11 +108,11 @@ pub async fn upload_docker_files(files: &[PathBuf]) -> Result<()> {
                 "  [{}/{}] {} ({}) ... ❌ 失败{}",
                 i + 1,
                 total,
-                result.filename,
+                r.filename,
                 size_str,
                 upload_type
             );
-            if let Some(err) = &result.error {
+            if let Some(err) = &r.error {
                 println!("         错误: {}", err);
             }
         }
@@ -137,21 +131,5 @@ pub async fn upload_docker_files(files: &[PathBuf]) -> Result<()> {
         ))
     } else {
         Ok(())
-    }
-}
-
-fn format_file_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
     }
 }
