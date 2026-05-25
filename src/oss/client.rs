@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
-use futures::future::join_all;
 use hmac::{Hmac, KeyInit, Mac};
 use quick_xml::events::Event;
 use quick_xml::name::QName;
@@ -449,7 +448,7 @@ impl OssClient {
         let mut file = tokio::fs::File::open(local_path).await?;
 
         let part_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PARTS));
-        let mut part_futures = Vec::new();
+        let mut part_handles = Vec::new();
 
         for part_number in 1..=total_parts {
             // Skip already-completed parts (resume from checkpoint)
@@ -460,7 +459,7 @@ impl OssClient {
             let offset = (part_number - 1) as u64 * PART_SIZE;
             let part_size = std::cmp::min(PART_SIZE, file_size - offset) as usize;
 
-            // CRITICAL FIX: acquire semaphore BEFORE reading to bound memory.
+            // Acquire semaphore BEFORE reading to bound memory
             let permit = Arc::clone(&part_semaphore)
                 .acquire_owned()
                 .await
@@ -476,8 +475,9 @@ impl OssClient {
             let cb = on_progress.clone();
             let part_bytes = part_size as u64;
 
-            part_futures.push(async move {
-                let _permit = permit;
+            // Spawn as independent task so it runs concurrently and releases permit
+            let handle = tokio::spawn(async move {
+                let _permit = permit; // held for duration of this part's upload
 
                 let mut last_err = None;
                 for attempt in 1..=MAX_PART_RETRIES {
@@ -503,9 +503,13 @@ impl OssClient {
                 }
                 Err(last_err.unwrap())
             });
+            part_handles.push(handle);
         }
 
-        let part_results = join_all(part_futures).await;
+        // Wait for all spawned tasks to complete
+        let part_results = futures::future::join_all(
+            part_handles.into_iter().map(|h| async { h.await.unwrap() })
+        ).await;
 
         let mut has_error = false;
         for result in part_results {
