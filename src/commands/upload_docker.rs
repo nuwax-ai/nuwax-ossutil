@@ -1,11 +1,25 @@
 use anyhow::Result;
 use chrono::Utc;
 use futures::future::join_all;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use super::common::{expand_paths, format_file_size, UploadResult};
 use crate::config::load_config;
+use crate::oss::client::ProgressCallback;
 use crate::oss::{OssClient, guess_content_type};
+
+const PROGRESS_TEMPLATE: &str =
+    "{msg:<15} [{elapsed_precise}] [{bar:20.cyan/blue}] {bytes}/{total_bytes} ({percent}%) {binary_bytes_per_sec}";
+
+fn new_progress_style() -> ProgressStyle {
+    ProgressStyle::with_template(PROGRESS_TEMPLATE)
+        .unwrap()
+        .progress_chars("██░")
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+}
 
 pub async fn upload_docker_files(files: &[PathBuf]) -> Result<()> {
     // Expand directories into file lists (always skip sub-directories)
@@ -36,7 +50,7 @@ pub async fn upload_docker_files(files: &[PathBuf]) -> Result<()> {
     println!("📤 开始上传 {} 个文件到 docker/{}/", total, timestamp_dir);
     println!();
 
-    // Build upload tasks
+    let mp = MultiProgress::new();
     let mut upload_futures = Vec::new();
 
     for file in &files {
@@ -51,15 +65,26 @@ pub async fn upload_docker_files(files: &[PathBuf]) -> Result<()> {
         let local_path = file.to_string_lossy().to_string();
         let client = client.clone();
 
-        upload_futures.push(async move {
-            let file_size = tokio::fs::metadata(&local_path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let is_multipart = file_size >= 5 * 1024 * 1024;
+        let file_size = tokio::fs::metadata(file)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let is_multipart = file_size >= 5 * 1024 * 1024;
 
+        // Create per-file progress bar
+        let pb = mp.add(ProgressBar::new(file_size));
+        pb.set_style(new_progress_style());
+        pb.set_message(filename.clone());
+        pb.enable_steady_tick(Duration::from_millis(200));
+
+        let pb_clone = pb.clone();
+        let on_progress: ProgressCallback = Arc::new(move |bytes_transferred| {
+            pb_clone.inc(bytes_transferred);
+        });
+
+        upload_futures.push(async move {
             let result = client
-                .upload_file_smart(&local_path, &remote_path, &content_type)
+                .upload_file_smart(&local_path, &remote_path, &content_type, Some(on_progress))
                 .await;
 
             let (download_url, error) = match result {
@@ -79,6 +104,9 @@ pub async fn upload_docker_files(files: &[PathBuf]) -> Result<()> {
 
     // Execute all uploads concurrently
     let results = join_all(upload_futures).await;
+
+    // Clear all progress bars
+    mp.clear()?;
 
     // Print results
     let mut success_count = 0;

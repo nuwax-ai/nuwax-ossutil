@@ -19,6 +19,9 @@ use super::validate::get_region_from_endpoint;
 
 type Result<T> = std::result::Result<T, OssError>;
 
+/// Progress callback: called with cumulative bytes transferred after each part/simple upload completes.
+pub type ProgressCallback = Arc<dyn Fn(u64) + Send + Sync + 'static>;
+
 /// Query parameters: key → value. Empty string value means flag parameter (e.g. "uploads" → "").
 type QueryParams = HashMap<String, String>;
 
@@ -275,11 +278,13 @@ impl OssClient {
 
     /// Smart upload: simple PUT for < 5MB, multipart for >= 5MB.
     /// Includes concurrency control via semaphore.
+    /// `on_progress` is called with cumulative bytes transferred after each part/simple upload completes.
     pub async fn upload_file_smart(
         &self,
         local_path: &str,
         remote_path: &str,
         content_type: &str,
+        on_progress: Option<ProgressCallback>,
     ) -> Result<String> {
         let _permit = self.semaphore.acquire().await.map_err(|e| {
             OssError::Other(format!("获取上传信号量失败: {}", e))
@@ -292,10 +297,10 @@ impl OssClient {
             .len();
 
         if file_size >= MULTIPART_THRESHOLD {
-            self.multipart_upload(local_path, &full_path, content_type, file_size)
+            self.multipart_upload(local_path, &full_path, content_type, file_size, on_progress)
                 .await
         } else {
-            self.simple_upload(local_path, &full_path, content_type, file_size)
+            self.simple_upload(local_path, &full_path, content_type, file_size, on_progress)
                 .await
         }
     }
@@ -361,7 +366,8 @@ impl OssClient {
         local_path: &str,
         remote_path: &str,
         content_type: &str,
-        _file_size: u64,
+        file_size: u64,
+        on_progress: Option<ProgressCallback>,
     ) -> Result<String> {
         let file_data = tokio::fs::read(local_path).await?;
 
@@ -383,6 +389,10 @@ impl OssClient {
         )
         .await?;
 
+        if let Some(cb) = &on_progress {
+            cb(file_size);
+        }
+
         Ok(self.generate_download_url(remote_path))
     }
 
@@ -391,38 +401,50 @@ impl OssClient {
     /// - Real streaming: semaphore acquired BEFORE reading each part (bounded memory)
     /// - Retry: each part retried up to 3 times with exponential backoff
     /// - Checkpoint: interrupted uploads resume from last completed part
+    /// - Progress: `on_progress` is called with cumulative bytes after each part completes
     async fn multipart_upload(
         &self,
         local_path: &str,
         remote_path: &str,
         content_type: &str,
         file_size: u64,
+        on_progress: Option<ProgressCallback>,
     ) -> Result<String> {
         let total_parts = file_size.div_ceil(PART_SIZE) as u32;
 
         // Checkpoint: try to resume an interrupted upload
-        let (upload_id, mut completed_parts) =
+        let (upload_id, mut completed_parts, resume_bytes) =
             match UploadCheckpoint::load(remote_path, local_path) {
                 Some(cp) if cp.can_resume(remote_path, local_path, file_size) => {
                     let done = cp.completed_parts.iter().filter(|p| p.is_some()).count();
+                    let bytes: u64 = cp.completed_parts.iter().enumerate().filter_map(|(i, p)| {
+                        p.as_ref().map(|_| {
+                            let offset = i as u64 * PART_SIZE;
+                            std::cmp::min(PART_SIZE, file_size - offset)
+                        })
+                    }).sum();
                     println!(
                         "   断点续传: 已完成 {}/{} 分片, UploadId: {}",
                         done, cp.total_parts, cp.upload_id
                     );
-                    (cp.upload_id, cp.completed_parts)
+                    (cp.upload_id, cp.completed_parts, bytes)
                 }
                 Some(stale_cp) => {
-                    // Checkpoint exists but file has changed — abort the old upload
-                    // to prevent orphaned multipart uploads accumulating on OSS
                     let _ = self.abort_multipart(remote_path, &stale_cp.upload_id).await;
                     let upload_id = self.initiate_multipart(remote_path, content_type).await?;
-                    (upload_id, vec![None; total_parts as usize])
+                    (upload_id, vec![None; total_parts as usize], 0u64)
                 }
                 None => {
                     let upload_id = self.initiate_multipart(remote_path, content_type).await?;
-                    (upload_id, vec![None; total_parts as usize])
+                    (upload_id, vec![None; total_parts as usize], 0u64)
                 }
             };
+
+        // Notify progress for already-completed parts (resume)
+        if resume_bytes > 0
+            && let Some(cb) = &on_progress {
+            cb(resume_bytes);
+        }
 
         let mut file = tokio::fs::File::open(local_path).await?;
 
@@ -439,7 +461,6 @@ impl OssClient {
             let part_size = std::cmp::min(PART_SIZE, file_size - offset) as usize;
 
             // CRITICAL FIX: acquire semaphore BEFORE reading to bound memory.
-            // Without this, all parts would be read into memory before any upload starts.
             let permit = Arc::clone(&part_semaphore)
                 .acquire_owned()
                 .await
@@ -452,18 +473,24 @@ impl OssClient {
             let client = self.clone();
             let uid = upload_id.clone();
             let rp = remote_path.to_string();
+            let cb = on_progress.clone();
+            let part_bytes = part_size as u64;
 
             part_futures.push(async move {
-                let _permit = permit; // held for duration of this part's upload
+                let _permit = permit;
 
                 let mut last_err = None;
                 for attempt in 1..=MAX_PART_RETRIES {
                     let is_last = attempt == MAX_PART_RETRIES;
-                    // Clone buffer for each attempt (negligible cost vs network I/O)
                     let data = buffer.clone();
 
                     match client.upload_part(uid.clone(), part_number, data, &rp).await {
-                        Ok(etag) => return Ok((part_number, etag)),
+                        Ok(etag) => {
+                            if let Some(cb) = &cb {
+                                cb(part_bytes);
+                            }
+                            return Ok((part_number, etag));
+                        }
                         Err(e) => {
                             if !is_last {
                                 let delay =
@@ -576,6 +603,7 @@ impl OssClient {
             .get("etag")
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
+            .trim_matches('"')
             .to_string();
 
         if etag.is_empty() {
