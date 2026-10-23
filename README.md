@@ -1,6 +1,6 @@
 # nuwax-ossutil
 
-阿里云 OSS 命令行上传工具，支持 OSS V1 签名认证。
+阿里云 OSS 命令行上传工具，支持 OSS V4 签名认证。
 
 对标服务端 `/api/v1/oss/upload/docker` 接口，提供完整的 Docker 文件上传能力：多文件并发上传、大文件自动分片、时间戳目录管理、CDN 域名下载链接生成。
 
@@ -10,11 +10,11 @@
 
 - **多文件并发上传**：最多 3 个文件并发上传，通过 Semaphore 控制并发数
 - **大文件分片上传**：文件 ≥ 5MB 自动切换为分片上传（10MB/片，最多 3 片并发）
-- **分片失败自动清理**：任一分片上传失败，自动调用 Abort Multipart Upload 清理已上传分片
+- **断点续传**：分片失败保留原任务和断点，重试沿用同一上传身份
 - **时间戳目录**：`upload-docker` 命令自动生成 `docker/{YYYYMMDDHHMMSS}/` 路径，与服务端接口行为一致
 - **CDN 域名支持**：可配置 CDN 域名，上传完成后返回 CDN 下载链接
 - **路径前缀**：支持全局路径前缀，自动拼接在远程路径前
-- **OSS V1 签名**：使用 HMAC-SHA1 实现阿里云 OSS V1 签名认证，不依赖官方 SDK
+- **OSS V1 签名**：使用 HMAC-SHA1 实现阿里云 OSS V4 签名认证，不依赖官方 SDK
 - **环境变量覆盖**：所有配置项均支持环境变量覆盖，方便 CI/CD 集成
 
 ---
@@ -112,12 +112,12 @@ nuwax-ossutil upload-docker -f ./dist/*
 | 文件大小 | 上传方式 | 说明 |
 |----------|----------|------|
 | < 5MB | 简单上传（PUT） | 整个文件读入内存，单次 PUT 请求 |
-| ≥ 5MB | 分片上传 | 10MB/片，最多 3 片并发，失败自动 Abort |
+| ≥ 5MB | 分片上传 | 10MB/片，最多 3 片并发，失败保留断点 |
 
 ### 上传文件（自定义路径）
 
 ```bash
-nuwax-ossutil upload -f ./local/file.zip -r custom/path/file.zip
+nuwax-ossutil upload -f ./local/file.zip -r custom/path
 ```
 
 ### 列出文件
@@ -153,7 +153,7 @@ nuwax-ossutil
 
 选项:
   -h, --help     打印帮助
-  -V, --version  打印版本号
+  -v, --version  打印版本号
 ```
 
 ---
@@ -230,3 +230,8 @@ Authorization = "OSS " + AccessKeyId + ":" + Base64(HMAC-SHA1(AccessKeySecret, S
 | `quick-xml` | 0.40 | XML 响应解析 |
 | `indicatif` | 0.18 | 进度条显示 |
 | `percent-encoding` | 2.x | URL 编码 |
+
+## 严格发布上传（0.1.8）
+
+新增 CRC64 校验、原子禁止覆盖和 JSON 回执；常规上传保持兼容。
+详见 [严格发布上传说明](docs/verified-release-upload.md)。

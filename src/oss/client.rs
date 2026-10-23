@@ -1,3 +1,5 @@
+mod verified;
+pub use verified::VerifiedReceipt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -541,19 +543,16 @@ impl OssClient {
             )));
         }
 
-        // All parts succeeded — clean up checkpoint and complete
-        UploadCheckpoint {
-            upload_id: upload_id.clone(),
-            remote_path: remote_path.to_string(),
-            local_path: local_path.to_string(),
-            file_size,
-            total_parts,
+        // Keep the checkpoint until multipart completion succeeds.
+        let checkpoint = UploadCheckpoint {
+            upload_id: upload_id.clone(), remote_path: remote_path.to_string(),
+            local_path: local_path.to_string(), file_size, total_parts,
             completed_parts: completed_parts.clone(),
-        }
-        .delete();
-
+        };
         let etags: Vec<String> = completed_parts.into_iter().flatten().collect();
-        self.complete_multipart(remote_path, &upload_id, etags).await
+        let result = self.complete_multipart(remote_path, &upload_id, etags).await?;
+        checkpoint.delete();
+        Ok(result)
     }
 
     /// Initiate multipart upload, returns UploadId

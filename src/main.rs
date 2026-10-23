@@ -19,6 +19,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Machine-readable verified-upload protocol capabilities.
+    Capabilities,
+    /// Read and validate strict release bucket configuration (no writes).
+    CheckBucket {
+        #[arg(long)] expected_bucket: String,
+        #[arg(long)] expected_endpoint: String,
+    },
+    /// Signed OSS metadata query with CRC64 (no writes).
+    Stat { #[arg(long)] remote: String },
     /// 配置阿里云 OSS 凭证
     Config {
         /// OSS Endpoint
@@ -59,6 +68,14 @@ enum Commands {
         /// 遇到目录时是否跳过 (true: 跳过目录, false: 报错退出)
         #[arg(long, default_value = "true", default_missing_value = "true", num_args = 0..=1, value_parser = clap::value_parser!(bool))]
         skip_dir: bool,
+        /// Require OSS atomic refusal of existing object keys.
+        #[arg(long)] forbid_overwrite: bool,
+        /// Compare full local CRC64 and size with OSS HEAD after upload.
+        #[arg(long)] verify_crc64: bool,
+        /// JSON report for verified uploads, written after each completed file.
+        #[arg(long)] report_json: Option<PathBuf>,
+        #[arg(long)] expected_bucket: Option<String>,
+        #[arg(long)] expected_endpoint: Option<String>,
     },
 
     /// 上传 Docker 文件到 OSS (自动生成 docker/{timestamp}/ 路径)
@@ -92,6 +109,16 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Capabilities => println!("{}", serde_json::json!({"protocol":"nuwax-verified-upload-v1", "forbid_overwrite":cfg!(unix), "verify_crc64":cfg!(unix), "report_json":true})),
+        Commands::CheckBucket { expected_bucket, expected_endpoint } => {
+            let client = oss::OssClient::new_verified(&config::load_config()?)?;
+            client.check_release_bucket(&expected_bucket, &expected_endpoint).await?;
+            println!("{}", serde_json::json!({"bucket":expected_bucket,"endpoint":expected_endpoint,"versioning":"never-enabled"}));
+        }
+        Commands::Stat { remote } => {
+            let client = oss::OssClient::new_verified(&config::load_config()?)?;
+            println!("{}", serde_json::to_string(&client.stat_verified(&remote).await?)?);
+        }
         Commands::Config {
             endpoint,
             key_id,
@@ -132,13 +159,21 @@ async fn main() -> Result<()> {
             println!("✅ 配置已保存到 ~/.config/nuwax-ossutil.toml");
         }
 
-        Commands::Upload { file, paths, remote, name, skip_dir } => {
+        Commands::Upload { file, paths, remote, name, skip_dir, forbid_overwrite, verify_crc64, report_json, expected_bucket, expected_endpoint } => {
             let mut all_files = file;
             all_files.extend(paths);
             if all_files.is_empty() {
                 return Err(anyhow::anyhow!("请指定至少一个文件或目录路径 (通过 -f 或直接传入位置参数)"));
             }
-            commands::upload_files(&all_files, &remote, name.as_deref(), skip_dir).await?;
+            if forbid_overwrite || verify_crc64 || report_json.is_some() || expected_bucket.is_some() || expected_endpoint.is_some() {
+                anyhow::ensure!(forbid_overwrite && verify_crc64 && name.is_none(), "strict upload requires --forbid-overwrite --verify-crc64 and no --name");
+                let bucket = expected_bucket.ok_or_else(|| anyhow::anyhow!("--expected-bucket required"))?;
+                let endpoint = expected_endpoint.ok_or_else(|| anyhow::anyhow!("--expected-endpoint required"))?;
+                let report = report_json.ok_or_else(|| anyhow::anyhow!("--report-json required"))?;
+                commands::verified_upload::upload(&all_files, &remote, &report, &bucket, &endpoint).await?;
+            } else {
+                commands::upload_files(&all_files, &remote, name.as_deref(), skip_dir).await?;
+            }
         }
 
         Commands::UploadDocker { file, paths } => {

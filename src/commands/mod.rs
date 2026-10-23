@@ -8,3 +8,5 @@ pub use upload::upload_files;
 pub use list::list_files;
 pub use r#delete::delete_file;
 pub use upload_docker::upload_docker_files;
+
+pub mod verified_upload;
